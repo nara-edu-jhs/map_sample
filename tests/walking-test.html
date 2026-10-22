@@ -1,0 +1,114 @@
+<!doctype html><meta charset="utf-8"><title>徒歩シミュレーターの自動テスト</title>
+<style>#gsi-map{position:relative;width:600px;height:500px}#map-layer{position:absolute;left:0;top:0;width:1280px;height:1280px}#walking-panel{position:relative}#results{white-space:pre-wrap}</style>
+<h1>徒歩シミュレーターの自動テスト（疑似データ）</h1><p>外部への通信は行いません。実データとの照合とは別の機能テストです。</p><pre id="results">実行中…</pre><div id="gsi-map"><div id="map-layer"></div></div>
+<script type="module">
+import {walkingDirection,DIRECTIONS} from '../js/walker.js?v=44-walk35';
+import {createWalker3D,shortestTurn,advanceHeading,legPose,armPose,gaitPose,rasterizeProjected} from '../js/walker-3d.js?v=44-walk35';
+import {metres,measure,atDistance,samples} from '../js/walk-core.js?v=44-walk35';
+import {projectWalk,unprojectWalk} from '../js/geo.js?v=44-walk35';
+import {checkWalkPoint,clearWalkHazards} from '../js/walk-hazards.js?v=44-walk35';
+import {initWalking} from '../js/walking.js?v=44-walk35';
+const log=[],output=document.querySelector('#results');
+function ok(value,label){if(!value)throw Error(label);log.push('PASS '+label);output.textContent=log.join('\n');}
+const delay=ms=>new Promise(r=>setTimeout(r,ms));
+async function until(test){for(let i=0;i<200;i++){if(test())return;await delay(10);}throw Error('timeout');}
+try {
+ for(const [i,name] of DIRECTIONS.entries()){const angle=i*Math.PI*2/DIRECTIONS.length;ok(walkingDirection(Math.sin(angle),-Math.cos(angle))===name,'人物の128方向判定 '+name);}
+ ok(walkingDirection(0,0,'north')==='north','終点で向きを保持');
+ ok(Math.abs(shortestTurn(359*Math.PI/180,Math.PI/180)-2*Math.PI/180)<1e-8,'359度から1度は短い向きに旋回');
+ ok(Math.abs(advanceHeading(0,Math.PI/2,.016))<=4*.016,'旋回速度を制限して向きの飛びを防ぐ');
+ const avatarCanvas=document.createElement('canvas'),avatar=createWalker3D(avatarCanvas);avatar.draw(0,false,1000);const rear=avatarCanvas.toDataURL();const anotherCanvas=document.createElement('canvas');createWalker3D(anotherCanvas).draw(Math.PI,false,1000);ok(rear!==anotherCanvas.toDataURL(),'正面と背面で見える面が変わる');
+ const alpha=avatarCanvas.getContext('2d').getImageData(0,0,162,246).data;ok(alpha.some((v,i)=>i%4===3&&v>0),'立体人物を実際の画素に描画');
+ const frontTri={v:[[0,0,2],[4,0,2],[0,4,2]],rgb:[255,0,0]},backTri={v:[[0,0,1],[4,0,1],[0,4,1]],rgb:[0,0,255]};
+ const depthA=rasterizeProjected([frontTri,backTri],4,4),depthB=rasterizeProjected([backTri,frontTri],4,4);
+ ok(depthA[0]===255&&depthA[2]===0,'手前の面が奥の面を隠す');ok(depthA.every((v,i)=>v===depthB[i]),'面の描画順を逆にしても同じ画像');
+ const gradient=rasterizeProjected([{v:frontTri.v,rgb:[0,0,0],colors:[[255,0,0],[0,255,0],[0,0,255]]}],4,4);ok(gradient[0]>0&&gradient[0]<255&&gradient[1]>0&&gradient[2]>0,'面の内部で陰影の色を滑らかに補間');
+ let legLengths=true,kneesForward=true,stanceFlat=true;
+ for(let i=0;i<120;i++)for(const side of [-1,1]){const pose=legPose(side,i*Math.PI/60),{hip,knee,ankle}=pose;const dist=(a,b)=>Math.hypot(...a.map((v,j)=>v-b[j]));legLengths&&=Math.abs(dist(hip,knee)-.43)<1e-6&&Math.abs(dist(knee,ankle)-.43)<1e-6;kneesForward&&=knee[2]>(hip[2]+ankle[2])/2;stanceFlat&&=!pose.stance||ankle[1]>=.111;}
+ let armsFixed=true,opposed=true;for(let i=0;i<120;i++)for(const side of [-1,1]){const phase=i*Math.PI/60,a=armPose(side,phase),leg=legPose(side,phase);const distance=(x,y)=>Math.hypot(...x.map((v,j)=>v-y[j]));armsFixed&&=Math.abs(distance(a.shoulder,a.elbow)-.25)<1e-6&&Math.abs(distance(a.elbow,a.wrist)-.23)<1e-6;opposed&&=a.elbow[2]*leg.ankle[2]<=.000001;}ok(armsFixed,'腕を振っても上腕と前腕の長さが一定');ok(opposed,'腕と同じ側の脚が逆方向へ動く');
+ ok(legLengths,'歩行中に太ももとすねの長さが伸縮しない');ok(kneesForward,'全歩行位相で膝が前方向に曲がる');ok(stanceFlat,'足首が地面より下へ沈まない');
+ const support=legPose(1,.31*Math.PI*2);ok(Math.hypot(...support.hip.map((v,i)=>v-support.ankle[i]))>.855,'身体を支える脚がほぼ伸びる');
+ ok(legPose(1,.58*Math.PI*2).pitch>0,'蹴り出しで靴のかかとが上がる');
+ ok(gaitPose(.31*Math.PI*2).pelvis[1]>.96,'支える脚に合わせて腰の高さが上がる');
+ let contactContinuous=true,contactVelocity=true;
+ for(const cycle of [0,.12,.5,.62,1]){
+  const p=cycle*Math.PI*2,h=1e-5;
+  const values=q=>{const g=gaitPose(q);return [...g.pelvis,...g.feet.flatMap(f=>[...f.ankle,f.pitch])];};
+  const a=values(p-h),b=values(p),c=values(p+h);
+  contactContinuous&&=a.every((v,i)=>Math.abs(v-c[i])<.0001);
+  contactVelocity&&=a.every((v,i)=>Math.abs((b[i]-v)/h-(c[i]-b[i])/h)<.01);
+ }
+ ok(contactContinuous,'着地・離地で足と腰の位置が飛ばない');ok(contactVelocity,'着地・離地で動く速さが急変しない');
+ let peakJointAcceleration=0;
+ const jointValues=q=>{const p=legPose(1,q);return [...p.pelvis,...p.knee,...p.ankle];};
+ const step=1/1200;
+ for(let i=0;i<1200;i++){
+  const p=i*step*2*Math.PI,a=jointValues(p-step*2*Math.PI),b=jointValues(p),c=jointValues(p+step*2*Math.PI);
+  peakJointAcceleration=Math.max(peakJointAcceleration,Math.hypot(...b.map((v,j)=>(a[j]-2*v+c[j])/(step*step))));
+ }
+ ok(peakJointAcceleration<40,'着地の前後も含めた全周期で膝・腰・足首の急加速を抑える');
+ let upright=true,extendedSupport=true;
+ for(let i=0;i<360;i++){
+  const p=i*Math.PI/180,g=gaitPose(p);upright&&=g.pelvis[1]>.96&&Math.abs(g.pelvis[2])<1e-9;
+  for(const side of [-1,1]){const l=legPose(side,p);if(l.stance)extendedSupport&&=Math.hypot(...l.hip.map((v,j)=>v-l.ankle[j]))>.858;}
+ }
+ ok(upright,'全歩行周期で腰を高く保ち、後ろへ引かない');
+ ok(extendedSupport,'接地中の支持脚は全周期でほぼ伸ばす');
+ const a={latitude:35,longitude:139},b={latitude:35.001,longitude:139};
+ ok(Math.abs(metres(a,b)-111.195)<.01,'球面距離：約111.195 m');
+ const line=[a,b,b,{latitude:35.001,longitude:139.001}],lengths=measure(line);
+ ok(Math.abs(atDistance(line,lengths,lengths[1]/2).latitude-35.0005)<1e-8,'線に沿った距離補間');
+ ok(atDistance(line,lengths,lengths.at(-1))===line.at(-1),'終点・重複頂点');
+ const ss=samples(line,lengths);ok(ss.every((s,i)=>!i||s.distance-ss[i-1].distance<=5.001)&&ss.at(-1).distance===lengths.at(-1),'5 m以下の間隔・終点サンプル');
+ for(const center of [{latitude:43.06,longitude:141.35},{latitude:35.68,longitude:139.76},{latitude:26.21,longitude:127.68}]){
+  const p={latitude:center.latitude+.001,longitude:center.longitude+.002};
+  for(const z of [3,15,17]){const q=projectWalk(p,center,z),r=unprojectWalk(q.x,q.y,center,z);ok(metres(p,r)<.001,`投影往復 ${center.latitude}度 z${z}`);}
+ }
+ const nativeFetch=window.fetch,nativeBitmap=window.createImageBitmap;
+ let scenario='hit';
+ const canvas=document.createElement('canvas');canvas.width=canvas.height=256;const ctx=canvas.getContext('2d');ctx.fillStyle='rgba(255,0,0,1)';ctx.fillRect(0,0,256,256);
+ const blob=await new Promise(r=>canvas.toBlob(r));
+ window.fetch=async url=>{
+   if(scenario==='fail')throw Error('offline');
+   if(scenario==='partial'&&String(url).includes('jisuberi'))return {ok:false};
+   if(scenario==='uncoloured'||scenario==='partial'){
+     const empty=document.createElement('canvas');empty.width=empty.height=256;return {ok:true,blob:()=>new Promise(r=>empty.toBlob(r))};
+   }
+   return {ok:true,blob:async()=>blob};
+ };
+ let risks=await checkWalkPoint(a);ok(risks.length===5&&risks.every(r=>r.status==='hit'),'実際の画像デコード・着色検出');
+ scenario='uncoloured';clearWalkHazards();risks=await checkWalkPoint(a);ok(risks.every(r=>r.status==='uncoloured'),'透明画像は未着色');
+ scenario='partial';clearWalkHazards();risks=await checkWalkPoint(a);ok(risks.find(r=>r.type===2).status==='unknown','土砂3画像の一部失敗を不明にする');
+ scenario='fail';clearWalkHazards();risks=await checkWalkPoint(a);ok(risks.every(r=>r.status==='unknown'),'通信失敗は全種類不明');
+ scenario='hit';clearWalkHazards();
+ let center={latitude:35.68,longitude:139.76},zoom=17;
+ const sim=initWalking(()=>({center,zoom})),map=document.querySelector('#gsi-map'),$=id=>document.querySelector('#'+id);
+ ok($('walk-draw').parentElement===$('walk-undo').parentElement&&$('walk-undo').parentElement===$('walk-clear').parentElement,'描く・戻す・消すが同じ操作グループ');
+ ok($('walking-panel').hidden&&$('walk-toggle').getAttribute('aria-expanded')==='false','初期状態は操作パネルを閉じる');$('walk-toggle').click();ok(!$('walking-panel').hidden,'ボタンで操作パネルを開く');
+ const nativeCapture=map.setPointerCapture.bind(map);map.setPointerCapture=()=>{};map.hasPointerCapture=()=>false;
+ function event(type,x,y,extra={}){map.dispatchEvent(new PointerEvent(type,{pointerId:1,pointerType:'touch',isPrimary:true,clientX:x,clientY:y,button:0,bubbles:true,cancelable:true,...extra}));}
+ function draw(){const rect=$('map-layer').getBoundingClientRect();event('pointerdown',rect.left+200,rect.top+200);event('pointermove',rect.left+250,rect.top+210);event('pointerup',rect.left+300,rect.top+220);}
+ $('walk-draw').click();draw();ok($('walk-metrics').textContent.includes('距離 99 m')||!$('walk-confirm').disabled,'タッチのPointerEventで経路入力');
+ $('walk-confirm').click();await until(()=>!$('walk-play').disabled);ok($('walk-warning').textContent.includes('洪水'),'経路確定時の警告');
+ $('walk-play').click();ok(document.querySelector('.walk-person').classList.contains('is-walking'),'再生中に歩行アニメーションを有効化');await delay(150);$('walk-play').click();ok(!document.querySelector('.walk-person').classList.contains('is-walking'),'一時停止で足踏みも停止');ok($('walk-status').textContent.includes('一時停止')&&!document.querySelector('.walk-person').hidden,'自動移動・一時停止');
+ $('walk-toggle').click();ok($('walking-panel').hidden&&!document.querySelector('.walk-person').classList.contains('is-walking'),'閉じるボタンでパネル非表示・足踏み停止');$('walk-toggle').click();
+ const pos=document.querySelector('.walk-person').style.left;await delay(100);ok(pos===document.querySelector('.walk-person').style.left,'停止中に移動しない');
+ const before=document.querySelector('polyline').getAttribute('points');zoom=16;sim.render();ok(before!==document.querySelector('polyline').getAttribute('points'),'ズーム時の経路再投影');
+ $('walk-play').click();await until(()=>$('walk-status').textContent.includes('到着'));ok($('walk-warning').textContent.includes('歩行終了'),'再開・終点停止・通過警告');
+ $('walk-draw').click();draw();$('walk-undo').click();ok(!$('walk-confirm').disabled,'ひと筆戻す');
+ $('walk-clear').click();ok(document.querySelector('polyline').getAttribute('points')===''&&$('walk-play').disabled,'消去時のリセット');
+ $('walk-draw').click();const rect=map.getBoundingClientRect();event('pointerdown',rect.left+200,rect.top+200);event('pointermove',rect.left+230,rect.top+200);event('pointercancel',rect.left+230,rect.top+200);ok($('walk-confirm').disabled,'タッチ中断で未確定のひと筆を破棄');
+ draw();scenario='fail';clearWalkHazards();$('walk-confirm').click();await until(()=>!$('walk-play').disabled);ok($('walk-warning').textContent.includes('不明')&&!$('walk-warning').textContent.includes('安全です'),'オフライン経路確認で安全と表示しない');
+ // A superseded async confirmation must not repopulate cleared state.
+ $('walk-draw').click();draw();window.fetch=()=>new Promise(r=>setTimeout(()=>r({ok:true,blob:async()=>blob}),50));clearWalkHazards();$('walk-confirm').click();$('walk-clear').click();await delay(120);ok($('walk-play').disabled&&document.querySelector('polyline').getAttribute('points')==='','確認処理中の消去・古い結果の抑止');
+ window.fetch=async()=>({ok:true,blob:async()=>blob});
+ for(const [dx,dy,expected] of [[0,-30,'north'],[0,30,'south'],[-30,0,'west'],[30,0,'east']]){
+  $('walk-clear').click();$('walk-draw').click();const box=map.getBoundingClientRect();
+  event('pointerdown',box.left+250,box.top+250);event('pointermove',box.left+250+dx,box.top+250+dy);event('pointerup',box.left+250+dx,box.top+250+dy);
+  $('walk-confirm').click();await until(()=>!$('walk-play').disabled);
+  ok(document.querySelector('.walk-person').dataset.direction===expected,'経路に応じた人物切替 '+expected);
+ }
+ window.fetch=nativeFetch;window.createImageBitmap=nativeBitmap;map.setPointerCapture=nativeCapture;
+ output.textContent=log.join('\n')+'\n\nすべて成功（'+log.length+'項目）';
+} catch(error){output.textContent=log.join('\n')+'\nFAIL '+error.stack;}
+</script>
