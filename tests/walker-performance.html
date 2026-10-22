@@ -1,6 +1,0 @@
-<!doctype html><meta charset="utf-8"><title>立体歩行者の描画確認</title><canvas id="avatar" style="width:108px;height:164px"></canvas><pre id="result">計測中…</pre><script type="module">
-import {createWalker3D} from '../js/walker-3d.js?v=44-walk35';
-const actor=createWalker3D(document.querySelector('canvas')),costs=[],intervals=[];let previous=0;
-function tick(now){if(previous)intervals.push(now-previous);previous=now;const start=performance.now();actor.draw(now/2500,true,now);costs.push(performance.now()-start);if(costs.length<60)requestAnimationFrame(tick);else{const avg=a=>a.reduce((x,y)=>x+y,0)/a.length;document.querySelector('#result').textContent=`60フレーム描画完了\n平均描画時間 ${avg(costs).toFixed(2)} ms\nフレーム間隔平均 ${avg(intervals).toFixed(2)} ms\nこの環境での参考値です。実機性能を保証しません。`;}}
-requestAnimationFrame(tick);
-</script>
